@@ -1,0 +1,21 @@
+name = "centramind-channels"
+main = "src/index.js"
+compatibility_date = "2026-05-08"
+compatibility_flags = ["nodejs_compat"]
+
+routes = [
+  { pattern = "channels.eternium.ai/*", zone_id = "2ccf9bd54040d93f2382875f2aa672d4" }
+]
+
+[observability]
+enabled = true
+
+[triggers]
+crons = ["* * * * *"]
+
+# Secrets (set via `wrangler secret put <NAME>`, never committed):
+#   SUPABASE_URL               -- https://wmahfjguvqvefgjpbcdc.supabase.co
+#   SUPABASE_SERVICE_ROLE_KEY  -- service role key
+#   CHANNELS_WORKER_TOKEN      -- bearer token for /send auth
+#   TELEGRAM_WEBHOOK_SECRET    -- shared secret for Telegram webhook verification
+#   TELEGRAM_BOT_TOKEN_SOVEREIGN -- bot token for sovereign agent
