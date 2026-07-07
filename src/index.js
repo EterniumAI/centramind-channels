@@ -1,7 +1,6 @@
 // centramind-channels Worker
 // Telegram webhook ingress + severity-routed notification outbox
 
-import { sendTelegram } from './senders/telegram.js';
 import { sendInbox } from './senders/inbox.js';
 
 const SEVERITY_ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
@@ -43,76 +42,11 @@ async function supabaseQuery(env, path, options = {}) {
 }
 
 function getSender(channelType) {
-  if (channelType === 'telegram') return sendTelegram;
+  if (channelType === 'telegram') {
+    throw new Error('telegram channel retired 2026-07-07');
+  }
   if (channelType === 'inbox') return sendInbox;
   return null;
-}
-
-// POST /webhooks/telegram/:agent_id
-async function handleTelegramWebhook(request, env, agentId) {
-  // Verify webhook secret
-  const secretHeader = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
-  const expectedSecret = env[`TELEGRAM_WEBHOOK_SECRET_${agentId.toUpperCase()}`] || env.TELEGRAM_WEBHOOK_SECRET || '';
-  if (!expectedSecret || secretHeader !== expectedSecret) {
-    return jsonError(403, 'Invalid webhook secret');
-  }
-
-  const update = await request.json().catch(() => null);
-  if (!update?.message?.text) return jsonOk({ ok: true, skipped: true });
-
-  const text = update.message.text;
-  const chatId = String(update.message.chat.id);
-
-  // Verify sender is authorized
-  const chanRes = await supabaseQuery(env,
-    `agent_channels?agent_id=eq.${agentId}&channel_type=eq.telegram&select=*`
-  );
-  if (!chanRes.ok || !chanRes.data?.length) {
-    return jsonError(403, 'No authorized channel found');
-  }
-
-  // Find channel matching this chat_id
-  const channel = chanRes.data.find(c => String(c.config?.chat_id) === chatId);
-  if (!channel) {
-    return jsonError(403, 'Chat not authorized for this agent');
-  }
-
-  // Forward to centramind-agent /chat
-  const agentRes = await fetch('https://centramind-agent.ty-823.workers.dev/chat', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${env.CHANNELS_WORKER_TOKEN}`,
-    },
-    body: JSON.stringify({
-      tenant_id: channel.tenant_id,
-      agent_id: agentId,
-      conversation_id: `tg-${chatId}`,
-      message: text,
-    }),
-  });
-
-  let reply = 'Sorry, I could not process your message.';
-  if (agentRes.ok) {
-    const agentData = await agentRes.json().catch(() => ({}));
-    reply = agentData.reply || reply;
-  }
-
-  // Send reply back via Telegram
-  const botToken = env[`TELEGRAM_BOT_TOKEN_${agentId.toUpperCase()}`];
-  if (botToken) {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: reply,
-        parse_mode: 'HTML',
-      }),
-    });
-  }
-
-  return jsonOk({ ok: true });
 }
 
 // POST /send
@@ -367,10 +301,10 @@ export default {
       return jsonOk({ ok: true, service: 'centramind-channels', ts: new Date().toISOString() });
     }
 
-    // Telegram webhook: POST /webhooks/telegram/:agent_id
+    // Telegram webhook: retired 2026-07-07
     const tgMatch = path.match(/^\/webhooks\/telegram\/([a-zA-Z0-9_-]+)$/);
     if (tgMatch && request.method === 'POST') {
-      return handleTelegramWebhook(request, env, tgMatch[1]);
+      return jsonError(410, 'Telegram webhook retired 2026-07-07');
     }
 
     // Internal send: POST /send
