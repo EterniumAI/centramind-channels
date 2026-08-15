@@ -16,6 +16,18 @@ crons = ["* * * * *"]
 # Secrets (set via `wrangler secret put <NAME>`, never committed):
 #   SUPABASE_URL               -- https://wmahfjguvqvefgjpbcdc.supabase.co
 #   SUPABASE_SERVICE_ROLE_KEY  -- service role key
-#   CHANNELS_WORKER_TOKEN      -- bearer token for /send auth
+#   CHANNELS_WORKER_TOKEN      -- bearer token for /send, /digest-flush,
+#                                 /publish-health and /publish-watchdog auth
 #   TELEGRAM_WEBHOOK_SECRET    -- shared secret for Telegram webhook verification
 #   TELEGRAM_BOT_TOKEN_SOVEREIGN -- bot token for sovereign agent
+
+# Optional publish-watchdog tuning (plain vars, safe to set here or leave unset):
+#   PUBLISH_GRACE_HOURS        -- hours after approved_at before an item with no
+#                                 scheduled_at counts as overdue (default 24)
+#   CHANNELS_DEFAULT_TENANT_ID -- tenant used for the stall alert when the
+#                                 content_pipeline row carries no tenant_id
+#   CHANNELS_DEFAULT_AGENT_ID  -- agent used for the stall alert (default sovereign)
+#
+# The stall alert routes on trigger_key "content.publish_stalled" at severity P1.
+# It needs an enabled notification_routing row for that trigger_key, otherwise
+# the alert is only recorded in notification_log with status no_route.

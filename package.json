@@ -1,10 +1,11 @@
 {
   "name": "centramind-channels",
   "version": "0.1.0",
-  "description": "Channel adapter for Centramind agents -- Telegram webhook ingress + severity-routed outbox",
+  "description": "Channel adapter for Centramind agents -- severity-routed notification outbox + publish-path watchdog",
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "node --test test/",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail"

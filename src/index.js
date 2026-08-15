@@ -1,15 +1,13 @@
 // centramind-channels Worker
-// Telegram webhook ingress + severity-routed notification outbox
+// Severity-routed notification outbox + publish-path watchdog
 
-import { sendInbox } from './senders/inbox.js';
+import { supabaseQuery } from './lib/supabase.js';
+import { deliver, dispatchNotification } from './notify.js';
+import { runPublishWatchdog, readPublishHealth } from './publish_watchdog.js';
 
-const SEVERITY_ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
-
-function severityAtOrAbove(severity, floor) {
-  const s = SEVERITY_ORDER[severity] ?? 3;
-  const f = SEVERITY_ORDER[floor] ?? 3;
-  return s <= f;
-}
+// The watchdog is cheap when healthy, but the cron fires every minute for the
+// digest flush and there is no reason to sweep the pipeline that often.
+const WATCHDOG_INTERVAL_MINUTES = 5;
 
 function jsonOk(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -25,151 +23,30 @@ function jsonError(status, error) {
   });
 }
 
-async function supabaseQuery(env, path, options = {}) {
-  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, {
-    method: options.method || 'GET',
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      'Content-Type': 'application/json',
-      ...(options.prefer ? { Prefer: options.prefer } : {}),
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  if (options.prefer === 'return=minimal') return { ok: res.ok, status: res.status };
-  const data = await res.json().catch(() => null);
-  return { ok: res.ok, status: res.status, data };
-}
-
-function getSender(channelType) {
-  if (channelType === 'telegram') {
-    throw new Error('telegram channel retired 2026-07-07');
-  }
-  if (channelType === 'inbox') return sendInbox;
-  return null;
+function authorized(request, env) {
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  return Boolean(token) && token === env.CHANNELS_WORKER_TOKEN;
 }
 
 // POST /send
 async function handleSend(request, env) {
-  // Auth
-  const auth = request.headers.get('Authorization') || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  if (!token || token !== env.CHANNELS_WORKER_TOKEN) {
-    return jsonError(401, 'Invalid token');
-  }
+  if (!authorized(request, env)) return jsonError(401, 'Invalid token');
 
   const body = await request.json().catch(() => null);
   if (!body) return jsonError(400, 'Invalid JSON');
 
-  const { tenant_id, agent_id, trigger_key, severity, title, body: msgBody, dedupe_key } = body;
+  const { tenant_id, trigger_key, severity, body: msgBody } = body;
   if (!tenant_id || !trigger_key || !severity || !msgBody) {
     return jsonError(400, 'Missing required fields: tenant_id, trigger_key, severity, body');
   }
 
-  const agentIdResolved = agent_id || 'sovereign';
-
-  // Load routing rules
-  const routeRes = await supabaseQuery(env,
-    `notification_routing?tenant_id=eq.${tenant_id}&agent_id=eq.${agentIdResolved}&trigger_key=eq.${encodeURIComponent(trigger_key)}&enabled=eq.true&select=*`
-  );
-
-  if (!routeRes.ok || !routeRes.data?.length) {
-    // No routing rules, log and return
-    await insertNotificationLog(env, {
-      tenant_id, agent_id: agentIdResolved, trigger_key, severity,
-      channel_id: null, title, body: msgBody, dedupe_key,
-      status: 'no_route', delivered_at: null, digest_batch_id: null,
-    });
-    return jsonOk({ ok: true, status: 'no_route', routes_evaluated: 0 });
-  }
-
-  const results = [];
-
-  for (const rule of routeRes.data) {
-    const channelId = rule.channel_id;
-
-    // Severity floor check
-    if (!severityAtOrAbove(severity, rule.severity_floor || 'P3')) {
-      await insertNotificationLog(env, {
-        tenant_id, agent_id: agentIdResolved, trigger_key, severity,
-        channel_id: channelId, title, body: msgBody, dedupe_key,
-        status: 'dropped', delivered_at: null, digest_batch_id: null,
-      });
-      results.push({ channel_id: channelId, status: 'dropped' });
-      continue;
-    }
-
-    // Dedupe check
-    if (rule.dedupe_window_sec > 0 && dedupe_key) {
-      const cutoff = new Date(Date.now() - rule.dedupe_window_sec * 1000).toISOString();
-      const dedupeRes = await supabaseQuery(env,
-        `notification_log?dedupe_key=eq.${encodeURIComponent(dedupe_key)}&tenant_id=eq.${tenant_id}&agent_id=eq.${agentIdResolved}&trigger_key=eq.${encodeURIComponent(trigger_key)}&channel_id=eq.${channelId}&created_at=gt.${cutoff}&limit=1&select=id`
-      );
-      if (dedupeRes.ok && dedupeRes.data?.length > 0) {
-        await insertNotificationLog(env, {
-          tenant_id, agent_id: agentIdResolved, trigger_key, severity,
-          channel_id: channelId, title, body: msgBody, dedupe_key,
-          status: 'deduped', delivered_at: null, digest_batch_id: null,
-        });
-        results.push({ channel_id: channelId, status: 'deduped' });
-        continue;
-      }
-    }
-
-    const mode = rule.mode || 'instant';
-
-    if (mode === 'instant') {
-      // Load channel config
-      const chanRes = await supabaseQuery(env,
-        `agent_channels?id=eq.${channelId}&select=*&limit=1`
-      );
-      const channel = chanRes.data?.[0];
-      const messageText = title ? `<b>${title}</b>\n\n${msgBody}` : msgBody;
-
-      if (channel) {
-        const sender = getSender(channel.channel_type);
-        if (sender) {
-          await sender(env, channel, messageText);
-        }
-      }
-
-      await insertNotificationLog(env, {
-        tenant_id, agent_id: agentIdResolved, trigger_key, severity,
-        channel_id: channelId, title, body: msgBody, dedupe_key,
-        status: 'sent', delivered_at: new Date().toISOString(), digest_batch_id: null,
-      });
-      results.push({ channel_id: channelId, status: 'sent' });
-    } else if (mode === 'digest') {
-      await insertNotificationLog(env, {
-        tenant_id, agent_id: agentIdResolved, trigger_key, severity,
-        channel_id: channelId, title, body: msgBody, dedupe_key,
-        status: 'queued', delivered_at: null, digest_batch_id: null,
-      });
-      results.push({ channel_id: channelId, status: 'queued' });
-    } else if (mode === 'silent') {
-      await insertNotificationLog(env, {
-        tenant_id, agent_id: agentIdResolved, trigger_key, severity,
-        channel_id: channelId, title, body: msgBody, dedupe_key,
-        status: 'silent', delivered_at: null, digest_batch_id: null,
-      });
-      results.push({ channel_id: channelId, status: 'silent' });
-    }
-  }
-
-  return jsonOk({ ok: true, results });
-}
-
-async function insertNotificationLog(env, row) {
-  await supabaseQuery(env, 'notification_log', {
-    method: 'POST',
-    body: row,
-    prefer: 'return=minimal',
-  });
+  const result = await dispatchNotification(env, body);
+  return jsonOk(result);
 }
 
 // POST /digest-flush (cron-triggered)
 async function handleDigestFlush(env) {
-  // Find digest routing rules
   const routeRes = await supabaseQuery(env,
     `notification_routing?mode=eq.digest&enabled=eq.true&select=*`
   );
@@ -181,7 +58,6 @@ async function handleDigestFlush(env) {
 
   for (const rule of routeRes.data) {
     // Check if the digest_cron matches "in the last 60s"
-    // Simple approach: parse cron and check if minute/hour match
     if (!rule.digest_cron) continue;
     if (!cronMatchesNow(rule.digest_cron, now)) continue;
 
@@ -190,7 +66,6 @@ async function handleDigestFlush(env) {
     const tenantId = rule.tenant_id;
     const agentId = rule.agent_id;
 
-    // Fetch queued items
     const queueRes = await supabaseQuery(env,
       `notification_log?status=eq.queued&trigger_key=eq.${encodeURIComponent(triggerKey)}&channel_id=eq.${channelId}&tenant_id=eq.${tenantId}&agent_id=eq.${agentId}&select=id,title,body,severity,created_at&order=created_at.asc&limit=100`
     );
@@ -200,7 +75,6 @@ async function handleDigestFlush(env) {
     const items = queueRes.data;
     const batchId = crypto.randomUUID();
 
-    // Build digest message
     const lines = items.map(item => {
       const prefix = item.severity ? `[${item.severity}] ` : '';
       const titlePart = item.title ? `<b>${item.title}</b>: ` : '';
@@ -208,19 +82,17 @@ async function handleDigestFlush(env) {
     });
     const digestText = `Digest (${items.length} items):\n\n${lines.map(l => `- ${l}`).join('\n')}`;
 
-    // Load channel and send
     const chanRes = await supabaseQuery(env,
       `agent_channels?id=eq.${channelId}&select=*&limit=1`
     );
-    const channel = chanRes.data?.[0];
-    if (channel) {
-      const sender = getSender(channel.channel_type);
-      if (sender) {
-        await sender(env, channel, digestText);
-      }
+    const failure = await deliver(env, chanRes.data?.[0], channelId, digestText);
+    if (failure) {
+      // Leave the items queued so a later flush can still deliver them, and do
+      // not let one broken channel abort the flush for every other rule.
+      console.error('digest flush delivery failed', channelId, failure);
+      continue;
     }
 
-    // Mark items as digested
     const ids = items.map(i => i.id);
     for (const id of ids) {
       await supabaseQuery(env, `notification_log?id=eq.${id}`, {
@@ -257,7 +129,6 @@ function cronMatchesNow(cronExpr, now) {
 
 function fieldMatches(field, value) {
   if (field === '*') return true;
-  // Handle comma-separated values
   const parts = field.split(',');
   for (const p of parts) {
     // Handle step values like */5
@@ -296,7 +167,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Health
+    // Health (liveness only -- says nothing about the publish path)
     if (path === '/health' || path === '/') {
       return jsonOk({ ok: true, service: 'centramind-channels', ts: new Date().toISOString() });
     }
@@ -314,20 +185,48 @@ export default {
 
     // Digest flush: POST /digest-flush
     if (path === '/digest-flush' && request.method === 'POST') {
-      const auth = request.headers.get('Authorization') || '';
-      const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-      if (!token || token !== env.CHANNELS_WORKER_TOKEN) {
-        return jsonError(401, 'Invalid token');
-      }
+      if (!authorized(request, env)) return jsonError(401, 'Invalid token');
       const result = await handleDigestFlush(env);
       return jsonOk({ ok: true, ...result });
+    }
+
+    // Publish health: GET /publish-health
+    // Read-only verdict for the daily publish check. Returns 503 when approved
+    // work is past due, so a caller that only looks at the status code still
+    // fails instead of reporting a green run against a dead publisher.
+    if (path === '/publish-health' && request.method === 'GET') {
+      if (!authorized(request, env)) return jsonError(401, 'Invalid token');
+      const result = await readPublishHealth(env);
+      return jsonOk(result, result.ok ? 200 : 503);
+    }
+
+    // Publish watchdog: POST /publish-watchdog
+    // Same verdict, but records the failed attempts and raises the alert.
+    if (path === '/publish-watchdog' && request.method === 'POST') {
+      if (!authorized(request, env)) return jsonError(401, 'Invalid token');
+      const result = await runPublishWatchdog(env);
+      return jsonOk(result, result.ok ? 200 : 503);
     }
 
     return jsonError(404, `Unknown route: ${request.method} ${path}`);
   },
 
   async scheduled(event, env, ctx) {
-    // Cron trigger: flush digests every minute
-    ctx.waitUntil(handleDigestFlush(env));
+    // Cron trigger: flush digests every minute, sweep the publish path every
+    // WATCHDOG_INTERVAL_MINUTES.
+    ctx.waitUntil(
+      handleDigestFlush(env).catch(err => console.error('digest flush failed', err))
+    );
+
+    const now = new Date(event.scheduledTime ?? Date.now());
+    if (now.getUTCMinutes() % WATCHDOG_INTERVAL_MINUTES === 0) {
+      ctx.waitUntil(
+        runPublishWatchdog(env, { now })
+          .then(result => {
+            if (!result.ok) console.error('publish watchdog unhealthy', JSON.stringify(result));
+          })
+          .catch(err => console.error('publish watchdog failed', err))
+      );
+    }
   },
 };
